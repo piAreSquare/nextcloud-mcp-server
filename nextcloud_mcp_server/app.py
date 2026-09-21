@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, urlparse
 
+import hmac
+
 import anyio
 import click
 import httpx
@@ -780,7 +782,39 @@ class OAuthAppContext:
         # See AppContext.eviction_task_group for rationale.
         return _vector_sync_state.eviction_task_group
 
+class StaticBearerMiddleware:
+    """Protect the MCP endpoint with a static Bearer token."""
 
+    def __init__(self, app: ASGIApp, token: str):
+        self.app = app
+        self.expected = f"Bearer {token}".encode()
+
+    async def __call__(
+        self,
+        scope: StarletteScope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+
+            # Protect MCP protocol endpoint only.
+            if path == "/mcp" or path.startswith("/mcp/"):
+                headers = dict(scope.get("headers", []))
+                supplied = headers.get(b"authorization", b"")
+
+                if not hmac.compare_digest(supplied, self.expected):
+                    response = JSONResponse(
+                        {"error": "unauthorized"},
+                        status_code=401,
+                        headers={
+                            "WWW-Authenticate": "Bearer"
+                        },
+                    )
+                    await response(scope, receive, send)
+                    return
+
+        await self.app(scope, receive, send)
 class BasicAuthMiddleware:
     """Middleware to extract BasicAuth credentials from Authorization header.
 
@@ -3200,5 +3234,10 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         logger.info(
             "BasicAuthMiddleware enabled - multi-user BasicAuth pass-through mode active"
         )
+    static_bearer_token = os.getenv("MCP_STATIC_BEARER_TOKEN")
 
+    if static_bearer_token:
+        app = StaticBearerMiddleware(app, static_bearer_token)
+        logger.info("Static Bearer authentication enabled for /mcp")
+        
     return app
